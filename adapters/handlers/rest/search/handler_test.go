@@ -49,6 +49,7 @@ import (
 	"github.com/weaviate/weaviate/usecases/auth/authorization/mocks"
 	"github.com/weaviate/weaviate/usecases/fakes"
 	"github.com/weaviate/weaviate/usecases/objects"
+	"github.com/weaviate/weaviate/usecases/queryadmission"
 	"github.com/weaviate/weaviate/usecases/schema/namespacing"
 	"github.com/weaviate/weaviate/usecases/sharding"
 	wlnamespaces "github.com/weaviate/weaviate/wl/namespaces"
@@ -785,6 +786,24 @@ func TestHandlerTraverserErrorMapping(t *testing.T) {
 			wantStatus: http.StatusUnprocessableEntity,
 		},
 		{
+			// ORDERING GUARD: near-text wraps the module's precondition in two
+			// ErrQueryVectorization layers; 422 must win over 500
+			name:       "missing vectorizer header (near-text chain)",
+			err:        nearTextPreconditionErr(),
+			wantStatus: http.StatusUnprocessableEntity,
+		},
+		{
+			name: "missing vectorizer header (hybrid chain)",
+			err: enterrors.NewErrQueryVectorization(pkgerrors.Wrap(
+				enterrors.NewErrModulePrecondition(errors.New(missingClusterURLMsg)), "remote client vectorize")),
+			wantStatus: http.StatusUnprocessableEntity,
+		},
+		{
+			name:       "query admission shed",
+			err:        fmt.Errorf("explorer: get class: vector search: %w", queryadmission.ErrOverloaded),
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
 			// a class deleted mid-request, in bm25_searcher's phrasing —
 			// classified 404 by the not-found marker. index.go's twin
 			// ("class ... not found in schema") does not match and stays a
@@ -873,9 +892,32 @@ func TestHandlerTraverserErrorMapping(t *testing.T) {
 	}
 }
 
+const missingClusterURLMsg = "no cluster URL found in request header: X-Weaviate-Cluster-Url"
+
+// nearTextPreconditionErr is text2vec-weaviate's missing cluster URL error
+// wrapped the way a near-text search delivers it to the handler, innermost
+// layer first.
+func nearTextPreconditionErr() error {
+	err := error(enterrors.NewErrModulePrecondition(errors.New(missingClusterURLMsg)))
+	err = pkgerrors.Wrap(err, "cluster URL")                                          // clients/weaviateembed
+	err = pkgerrors.Wrap(err, "text2vec-weaviate module")                             // text2vec-weaviate client
+	err = pkgerrors.Wrap(err, "remote client vectorize")                              // text2vecbase
+	err = pkgerrors.Wrap(err, "vectorize keywords")                                   // nearText searcher
+	err = fmt.Errorf("vectorize params: %w", enterrors.NewErrQueryVectorization(err)) // modules
+	err = fmt.Errorf("vectorize params: %w", enterrors.NewErrQueryVectorization(err)) // traverser near params
+	err = fmt.Errorf("explorer: get class: vectorize search vector: %w", enterrors.NewErrQueryVectorization(err))
+	return pkgerrors.Wrap(err, "explorer: get class: concurrentTargetVectorSearch")
+}
+
+// nearTextPreconditionChain is nearTextPreconditionErr's full message.
+const nearTextPreconditionChain = "explorer: get class: concurrentTargetVectorSearch: " +
+	"explorer: get class: vectorize search vector: vectorize params: vectorize params: " +
+	"vectorize keywords: remote client vectorize: text2vec-weaviate module: cluster URL: " + missingClusterURLMsg
+
 // TestStatusFromErrorMessages: engine errors reach the client with their wrap
-// chain intact, for parity with GraphQL and gRPC. The one exception is the
-// provider response, whose credential-bearing detail stays in the log.
+// chain intact, for parity with GraphQL and gRPC. The exceptions are the
+// provider response, whose credential-bearing detail stays in the log, and
+// the module precondition, whose own sentence is all the caller needs.
 func TestStatusFromErrorMessages(t *testing.T) {
 	wrap := func(err error) error {
 		return fmt.Errorf("explorer: get class: vector search: object search at index movie: local shard object search movie_abc: %w", err)
@@ -922,6 +964,20 @@ func TestStatusFromErrorMessages(t *testing.T) {
 			wantCause:  "sk-bad",
 		},
 		{
+			name:       "missing vectorizer header shows the module's sentence, the chain as cause",
+			err:        nearTextPreconditionErr(),
+			wantStatus: http.StatusUnprocessableEntity,
+			wantMsg:    missingClusterURLMsg,
+			wantCause:  nearTextPreconditionChain,
+		},
+		{
+			name:       "admission shed is the GraphQL rate-limit message, the shed as cause",
+			err:        wrap(queryadmission.ErrOverloaded),
+			wantStatus: http.StatusTooManyRequests,
+			wantMsg:    enterrors.NewErrRateLimit().Error(),
+			wantCause:  queryadmission.ErrOverloaded.Error(),
+		},
+		{
 			name:       "unclassified failure is a 500 carrying the chain",
 			err:        wrap(errors.New("trying parse time as RFC3339 string: cannot parse")),
 			wantStatus: http.StatusInternalServerError,
@@ -956,31 +1012,74 @@ func TestStatusFromErrorMessages(t *testing.T) {
 }
 
 // TestHandlerLogsFailures: server-side failures are logged with their full
-// cause, client errors only at debug level.
+// cause, a missing vectorizer header at warn level, other client errors only
+// at debug level.
 func TestHandlerLogsFailures(t *testing.T) {
-	deps := newTestHandler(t)
-	logger, hook := test.NewNullLogger()
-	logger.SetLevel(logrus.DebugLevel)
-	deps.handler.logger = logger
+	tests := []struct {
+		name        string
+		searcherErr error
+		body        string
+		wantStatus  int
+		wantLevel   logrus.Level
+		wantLogged  string
+		wantHidden  string
+	}{
+		{
+			name:        "provider failure logs at error, hidden from the client",
+			searcherErr: enterrors.NewErrQueryVectorization(errors.New("provider said: Incorrect API key provided: sk-bad")),
+			body:        `{"query":["space"]}`,
+			wantStatus:  http.StatusInternalServerError,
+			wantLevel:   logrus.ErrorLevel,
+			wantLogged:  "sk-bad",
+			wantHidden:  "sk-bad",
+		},
+		{
+			name:        "missing vectorizer header logs at warn with the full chain",
+			searcherErr: nearTextPreconditionErr(),
+			body:        `{"query":["space"]}`,
+			wantStatus:  http.StatusUnprocessableEntity,
+			wantLevel:   logrus.WarnLevel,
+			wantLogged:  nearTextPreconditionChain,
+			wantHidden:  "vectorize keywords",
+		},
+		{
+			name: "no vectorizer configured stays at debug",
+			searcherErr: enterrors.NewErrQueryVectorization(
+				enterrors.NewErrNoVectorizerModule(errors.New("no vectorizer module configured"))),
+			body:       `{"query":["space"]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantLevel:  logrus.DebugLevel,
+		},
+		{
+			name:       "invalid request stays at debug",
+			body:       `{"query":[]}`,
+			wantStatus: http.StatusBadRequest,
+			wantLevel:  logrus.DebugLevel,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deps := newTestHandler(t)
+			logger, hook := test.NewNullLogger()
+			logger.SetLevel(logrus.DebugLevel)
+			deps.handler.logger = logger
+			deps.searcher.err = tt.searcherErr
 
-	deps.searcher.err = enterrors.NewErrQueryVectorization(errors.New("provider said: Incorrect API key provided: sk-bad"))
-	_, apiErr := doNearText(t, deps, nil, "Movie", `{"query":["space"]}`)
-	require.NotNil(t, apiErr)
-	assert.Equal(t, http.StatusInternalServerError, apiErr.Status)
-	assert.NotContains(t, apiErr.Error(), "sk-bad")
+			_, apiErr := doNearText(t, deps, nil, "Movie", tt.body)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, tt.wantStatus, apiErr.Status)
+			if tt.wantHidden != "" {
+				assert.NotContains(t, apiErr.Error(), tt.wantHidden)
+			}
 
-	require.Len(t, hook.AllEntries(), 1)
-	entry := hook.LastEntry()
-	assert.Equal(t, logrus.ErrorLevel, entry.Level)
-	assert.Contains(t, entry.Message, "sk-bad")
-	assert.Equal(t, "near-text", entry.Data["op"])
-	assert.Equal(t, "Movie", entry.Data["collection"])
-
-	hook.Reset()
-	_, apiErr = doNearText(t, deps, nil, "Movie", `{"query":[]}`)
-	require.NotNil(t, apiErr)
-	require.Len(t, hook.AllEntries(), 1)
-	assert.Equal(t, logrus.DebugLevel, hook.LastEntry().Level)
+			require.Len(t, hook.AllEntries(), 1)
+			entry := hook.LastEntry()
+			assert.Equal(t, tt.wantLevel, entry.Level)
+			assert.Contains(t, entry.Message, tt.wantLogged)
+			assert.Equal(t, "near-text", entry.Data["op"])
+			assert.Equal(t, "Movie", entry.Data["collection"])
+		})
+	}
 }
 
 // TestBm25HandlerHappyPath: the bm25 wrapper drives the same execute() flow

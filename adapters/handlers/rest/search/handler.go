@@ -35,6 +35,7 @@ import (
 	"github.com/weaviate/weaviate/usecases/auth/authorization"
 	autherrs "github.com/weaviate/weaviate/usecases/auth/authorization/errors"
 	"github.com/weaviate/weaviate/usecases/objects"
+	"github.com/weaviate/weaviate/usecases/queryadmission"
 	"github.com/weaviate/weaviate/usecases/schema/namespacing"
 )
 
@@ -269,6 +270,13 @@ func (h *Handler) logAPIError(op, collection string, apiErr *APIError) {
 		entry.Errorf("%s failed: %v", op, apiErr.Cause())
 		return
 	}
+	// a 422 for a missing vectorizer header is the caller's fault, yet
+	// operators need to see it with Debug logging off
+	var precondition enterrors.ErrModulePrecondition
+	if apiErr.Status == http.StatusUnprocessableEntity && errors.As(apiErr.Cause(), &precondition) {
+		entry.Warnf("%s rejected: %v", op, apiErr.Cause())
+		return
+	}
 	entry.Debugf("%s rejected: %v", op, apiErr.Cause())
 }
 
@@ -368,10 +376,10 @@ const errClassNotFoundMarker = "could not find class"
 // errors.Is/As. This relies on the wrap chain staying %w/Wrapf (never
 // %v/%s), or the typed matches silently degrade to 500.
 //
-// ORDERING: ErrNoVectorizerModule (422), ErrSourceObjectNotFound (400),
-// ErrSourceObjectNoVector (422) and ErrDirtyReadOfDeletedObject (400) must
-// precede ErrQueryVectorization (500) — each arrives wrapped inside the
-// latter.
+// ORDERING: ErrNoVectorizerModule (422), ErrModulePrecondition (422),
+// ErrSourceObjectNotFound (400), ErrSourceObjectNoVector (422) and
+// ErrDirtyReadOfDeletedObject (400) must precede ErrQueryVectorization (500)
+// — each arrives wrapped inside the latter.
 func statusFromError(err error) *APIError {
 	var forbidden autherrs.Forbidden
 	if errors.As(err, &forbidden) {
@@ -381,10 +389,15 @@ func statusFromError(err error) *APIError {
 	if errors.As(err, &rateLimit) {
 		return &APIError{Status: http.StatusTooManyRequests, Err: err}
 	}
+	if errors.Is(err, queryadmission.ErrOverloaded) {
+		// admission shed: answer like GraphQL, the shed text stays in the log
+		return &APIError{Status: http.StatusTooManyRequests, Err: enterrors.NewErrRateLimit(), cause: err}
+	}
 
 	var (
 		multiTenancy  objects.ErrMultiTenancy
 		noVectorizer  enterrors.ErrNoVectorizerModule
+		precondition  enterrors.ErrModulePrecondition
 		srcNotFound   enterrors.ErrSourceObjectNotFound
 		srcNoVector   enterrors.ErrSourceObjectNoVector
 		dirtyRead     objects.ErrDirtyReadOfDeletedObject
@@ -405,6 +418,10 @@ func statusFromError(err error) *APIError {
 	case errors.As(err, &noVectorizer):
 		// must stay above ErrQueryVectorization (see func doc)
 		return &APIError{Status: http.StatusUnprocessableEntity, Err: err}
+	case errors.As(err, &precondition):
+		// a missing vectorizer header or env var, raised before any provider
+		// call: the module's own sentence is safe and actionable for the caller
+		return &APIError{Status: http.StatusUnprocessableEntity, Err: precondition, cause: err}
 	case errors.As(err, &srcNotFound):
 		// near-object: the id names no object — a bad body value, like an
 		// unknown targetVector (must stay above ErrQueryVectorization)
