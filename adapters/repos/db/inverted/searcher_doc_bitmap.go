@@ -54,6 +54,14 @@ func (s *Searcher) docBitmap(ctx context.Context, b *lsmkv.Bucket, limit int,
 	}
 	strategy = b.Strategy()
 
+	// Like on tokenized text with a pattern whose wildcards must span token
+	// boundaries is matched against each document's token set, not against
+	// single keys (issue #13565). Only Like leaves on text ever carry an
+	// arrangement, so every other operator falls through unchanged.
+	if pv.likeArr != nil {
+		return s.docBitmapLikeArrangement(ctx, b, pv)
+	}
+
 	// all other operators perform operations on the inverted index which we
 	// can serve directly
 	switch b.Strategy() {

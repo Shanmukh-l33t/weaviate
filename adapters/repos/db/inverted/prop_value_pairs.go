@@ -56,6 +56,12 @@ type propValuePair struct {
 	// same — and newBatchedContainsPair guarantees a batched leaf never holds
 	// zero keys, so the two states can't be confused.
 	containsKeys entsInverted.SortedKeys
+
+	// likeArr is set on Like leaves over tokenized text whose pattern has
+	// wildcards spanning token boundaries (at least two literal runs). Such a
+	// leaf is matched against the document's whole token set instead of
+	// against single index keys; see docBitmapLikeArrangement.
+	likeArr *likeArrangement
 }
 
 func newPropValuePair(class *models.Class) (*propValuePair, error) {

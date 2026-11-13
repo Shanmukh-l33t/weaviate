@@ -887,6 +887,10 @@ func (s *Searcher) extractTokenizableProp(prop *models.Property, propType schema
 	}
 
 	var terms []string
+	// effectiveTok is the tokenization the query input is analyzed with; it is
+	// consulted again below to decide whether Like terms need token-set
+	// matching. Empty for non-text types.
+	var effectiveTok string
 	switch propType {
 	case schema.DataTypeText:
 		// effectiveTok consults the per-shard tokenization overlay (set
@@ -895,7 +899,7 @@ func (s *Searcher) extractTokenizableProp(prop *models.Property, propType schema
 		// Both the LIKE wildcard path and the standard analyze path
 		// tokenize query input against effectiveTok so the resulting
 		// terms match the bucket content on this shard.
-		effectiveTok := ResolveTokenization(s.tokResolver, prop.Name, prop.Tokenization)
+		effectiveTok = ResolveTokenization(s.tokResolver, prop.Name, prop.Tokenization)
 		// if the operator is like, we cannot apply the regular text-splitting
 		// logic as it would remove all wildcard symbols
 		if operator == filters.OperatorLike {
@@ -934,7 +938,7 @@ func (s *Searcher) extractTokenizableProp(prop *models.Property, propType schema
 
 	propValuePairs := make([]*propValuePair, 0, len(terms))
 	for _, term := range terms {
-		propValuePairs = append(propValuePairs, &propValuePair{
+		pv := &propValuePair{
 			value:              []byte(term),
 			prop:               prop.Name,
 			operator:           operator,
@@ -942,7 +946,18 @@ func (s *Searcher) extractTokenizableProp(prop *models.Property, propType schema
 			hasSearchableIndex: hasSearchableIndex,
 			hasRangeableIndex:  hasRangeableIndex,
 			Class:              class,
-		})
+		}
+		// A Like pattern whose wildcards must span token boundaries (e.g.
+		// "a*c" over the tokens of "a.c") cannot be matched key by key; such
+		// terms are matched against the document's token set instead (issue
+		// #13565). Trigram is excluded: its keys are trigram slices, not
+		// value tokens, so cross-key matching has no meaning there.
+		if operator == filters.OperatorLike && effectiveTok != models.PropertyTokenizationTrigram {
+			if arr := parseLikeArrangement([]byte(term)); arr.crossesTokenBoundaries() {
+				pv.likeArr = arr
+			}
+		}
+		propValuePairs = append(propValuePairs, pv)
 	}
 
 	if len(propValuePairs) > 1 {
